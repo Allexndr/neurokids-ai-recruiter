@@ -22,13 +22,13 @@ class Settings(BaseSettings):
     telegram_hr_chat_id: str = ""
     hr_pin: str = ""
 
-    ai_provider: str = "groq"
+    ai_provider: str = "together"
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     openrouter_api_key: str = ""
     openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
     together_api_key: str = ""
-    together_model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+    together_model: str = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
     openai_api_key: str = ""
 
     hh_client_id: str = ""

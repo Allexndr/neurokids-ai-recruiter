@@ -8,14 +8,14 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-TOGETHER_API_BASE = "https://api.together.xyz/v1"
+TOGETHER_API_BASE = "https://api.together.ai/v1"
 
 
 class TogetherClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        model: str = "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     ):
         self.api_key = api_key
         self.model = model

@@ -79,6 +79,7 @@ async def health():
         "telegram": settings.is_telegram_configured,
         "whatsapp": settings.is_whatsapp_configured,
         "llm": settings.is_llm_configured,
+        "together": settings.is_together_configured,
         "hh": settings.is_hh_configured,
         "calendar": settings.is_google_calendar_configured,
         "hr_notify": settings.is_hr_notify_configured,

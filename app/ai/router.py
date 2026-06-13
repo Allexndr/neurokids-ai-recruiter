@@ -1,4 +1,4 @@
-"""Multi-provider LLM router: Groq → OpenRouter → Together."""
+"""Multi-provider LLM router: Together (primary) → Groq → OpenRouter."""
 
 from __future__ import annotations
 
@@ -28,7 +28,15 @@ class LLMRouter:
         temperature: float = 0.25,
         max_tokens: int = 800,
     ) -> tuple[str | None, str | None]:
-        if self.settings.groq_api_key:
+        provider = (self.settings.ai_provider or "together").lower()
+
+        if provider == "together" and self._together:
+            text, err = await self._together.chat(messages, temperature, max_tokens)
+            if text:
+                return text, None
+            logger.warning("Together failed: %s", err)
+
+        if provider in ("together", "groq") and self.settings.groq_api_key:
             text, err = await self._openai_compatible(
                 GROQ_BASE,
                 self.settings.groq_api_key,
@@ -40,6 +48,11 @@ class LLMRouter:
             if text:
                 return text, None
             logger.warning("Groq failed: %s", err)
+
+        if self._together and provider != "together":
+            text, err = await self._together.chat(messages, temperature, max_tokens)
+            if text:
+                return text, None
 
         if self.settings.openrouter_api_key:
             text, err = await self._openai_compatible(
