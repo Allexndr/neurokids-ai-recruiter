@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from app.calendar.google_calendar import GoogleCalendarClient
 
 WORK_START_H = 10
 WORK_END_H = 20
@@ -94,8 +98,32 @@ def available_slots(now: datetime | None = None, tz_name: str = "Asia/Almaty") -
     return unique[:6]
 
 
-def slot_by_id(slot_id: str, now: datetime | None = None, tz_name: str = "Asia/Almaty") -> InterviewSlot | None:
-    for s in available_slots(now, tz_name):
+def bookable_slots(
+    tz_name: str = "Asia/Almaty",
+    gcal: GoogleCalendarClient | None = None,
+    now: datetime | None = None,
+) -> list[InterviewSlot]:
+    """Слоты с учётом занятости HR-календаря (модуль 3 ТЗ)."""
+    slots = available_slots(now=now, tz_name=tz_name)
+    if gcal and gcal.available:
+        tz = _tz(tz_name)
+        ref = now or datetime.now(tz)
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=tz)
+        else:
+            ref = ref.astimezone(tz)
+        busy = gcal.get_busy_slots(ref, ref + timedelta(days=14))
+        slots = gcal.filter_available_slots(slots, busy)
+    return slots
+
+
+def slot_by_id(
+    slot_id: str,
+    now: datetime | None = None,
+    tz_name: str = "Asia/Almaty",
+    gcal: GoogleCalendarClient | None = None,
+) -> InterviewSlot | None:
+    for s in bookable_slots(tz_name=tz_name, gcal=gcal, now=now):
         if s.slot_id == slot_id:
             return s
     return None

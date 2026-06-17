@@ -9,7 +9,7 @@ AI HR-ассистент в Telegram: скрининг кандидатов, AI-
 3. **Интервью** — слоты + Google Calendar
 4. **Напоминания** — за 24 ч и 1 ч с подтверждением
 5. **Анализ интервью** — Groq/OpenAI Whisper + LLM-карточка
-6. **База кандидатов** — SQLite/Postgres, рейтинг, поиск
+6. **База кандидатов** — MongoDB Atlas (Vercel) / SQLite (локально), рейтинг, поиск
 
 ## Быстрый старт
 
@@ -43,10 +43,25 @@ python scripts/run_polling.py
 | `HH_ACCESS_TOKEN` | HH.ru API (отклики бесплатно, поиск — платно) |
 | `WHATSAPP_*` | Meta Cloud API |
 | `GOOGLE_*` | Google Calendar |
+| `MONGODB_URI` | MongoDB Atlas — сессии, кандидаты, voice jobs (обязательно на Vercel) |
+| `BLOB_READ_WRITE_TOKEN` | Vercel Blob — голосовые и резюме (авто при линке store к проекту) |
 
-## HR-команды в Telegram
+### Vercel Storage
 
-Отправляйте из чата `TELEGRAM_HR_CHAT_ID`:
+1. **MongoDB Atlas** (`atlas-coffee-dog`) — `MONGODB_URI` в env проекта `botforbus`
+2. **Blob** (`ataman-hr-bot-blob`) — подключить store к проекту → `BLOB_READ_WRITE_TOKEN` появится сам
+
+Пути в Blob: `neurokids-hr-bot/voice/job_{id}.bin`, `neurokids-hr-bot/resumes/candidate_{id}/...`
+
+Без Mongo на Vercel данные в `/tmp` SQLite **теряются** при каждом cold start.
+
+## HR в Telegram
+
+Панель HR (`TELEGRAM_HR_CHAT_ID`) — **одно сообщение + inline-кнопки**. Команды `/` тоже работают.
+
+Кнопки: кандидаты, рейтинг, вакансии, HH sync, поиск, сравнение, импорт PDF/CSV.
+
+Команды для точных действий:
 
 - `/vacancy create Менеджер \| продажи, CRM`
 - `/candidates` — топ кандидатов
@@ -54,13 +69,25 @@ python scripts/run_polling.py
 - `/import_resume` + файл PDF
 - `/hh_responses VACANCY_ID`
 
-## Cron напоминаний
+## Cron
 
 ```bash
+# Напоминания кандидатам (каждые 15 мин)
 curl "https://YOUR_URL/api/cron/reminders?secret=CRON_SECRET"
+
+# Фоновые голосовые
+curl "https://YOUR_URL/api/cron/voice-jobs?secret=CRON_SECRET"
+
+# Авто-сбор откликов HH (каждые 30–60 мин, нужен /vacancy link + HH_ACCESS_TOKEN)
+curl "https://YOUR_URL/api/cron/hh-sync?secret=CRON_SECRET"
 ```
 
-Каждые 15 мин (cron-job.org).
+### Длинные голосовые (до 40 мин)
+
+Webhook сразу отвечает Telegram; транскрипция идёт фоном по кускам (~5 мин каждый).
+
+- Нужен **GROQ_API_KEY** или **OPENAI_API_KEY** (Whisper)
+- Подвисшие задачи: `GET /api/cron/voice-jobs?secret=CRON_SECRET` (раз в 1–2 мин)
 
 ## Тесты
 

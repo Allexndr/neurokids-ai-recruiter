@@ -11,11 +11,12 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from app.ai.router import LLMRouter
 from app.bot.engine import BotEngine
 from app.bot.handlers import handle_telegram_update
-from app.bot.scheduling import available_slots
+from app.bot.scheduling import available_slots, bookable_slots
 from app.calendar.google_calendar import GoogleCalendarClient
 from app.comms.whatsapp_client import WhatsAppClient
 from app.config import get_settings
-from app.storage.db import store
+from app.interview.voice_processor import process_stale_voice_jobs, process_voice_job_step
+from app.storage import store
 from app.telegram_api import TelegramClient
 
 logging.basicConfig(
@@ -82,7 +83,12 @@ async def health():
         "together": settings.is_together_configured,
         "hh": settings.is_hh_configured,
         "calendar": settings.is_google_calendar_configured,
+        "mongodb": settings.is_mongodb_configured,
+        "blob": settings.is_blob_configured,
         "hr_notify": settings.is_hr_notify_configured,
+        "stt": settings.is_stt_configured,
+        "voice_chunk_sec": settings.voice_chunk_seconds,
+        "max_voice_min": settings.max_voice_duration_sec // 60,
     }
 
 
@@ -151,7 +157,7 @@ async def whatsapp_webhook(request: Request):
     session.profile.setdefault("ui_mode", "whatsapp")
     session.profile["lang_locked"] = True
     if session.state == "choose_view":
-        session.state = "collect_name_age"
+        session.state = "choose_lang"
     await store.log_message(chat_id, "in", text, channel="whatsapp")
 
     reply = await engine.handle(session, text, is_callback=False)
@@ -180,6 +186,69 @@ async def cron_reminders(
         return {"sent": 0}
     n = await engine.process_reminders()
     return {"sent": n}
+
+
+def _check_job_secret(request: Request, authorization: str, settings) -> None:
+    secret = settings.cron_secret or settings.admin_token
+    if not secret:
+        return
+    auth = authorization.replace("Bearer ", "").strip()
+    q = request.query_params.get("secret", "")
+    if auth != secret and q != secret:
+        raise HTTPException(403, "Forbidden")
+
+
+@app.post("/api/jobs/voice/{job_id}")
+async def voice_job_step(
+    job_id: int,
+    request: Request,
+    authorization: str = Header(default=""),
+):
+    await ensure_ready()
+    settings = get_settings()
+    _check_job_secret(request, authorization, settings)
+    if not tg_client:
+        raise HTTPException(503, "Telegram not configured")
+    result = await process_voice_job_step(job_id, settings, tg_client, llm_router)
+    return result
+
+
+@app.get("/api/cron/voice-jobs")
+@app.post("/api/cron/voice-jobs")
+async def cron_voice_jobs(
+    request: Request,
+    authorization: str = Header(default=""),
+):
+    await ensure_ready()
+    settings = get_settings()
+    _check_job_secret(request, authorization, settings)
+    if not tg_client:
+        return {"processed": 0}
+    n = await process_stale_voice_jobs(settings, tg_client, llm_router)
+    return {"processed": n}
+
+
+@app.get("/api/cron/hh-sync")
+@app.post("/api/cron/hh-sync")
+async def cron_hh_sync(
+    request: Request,
+    authorization: str = Header(default=""),
+):
+    await ensure_ready()
+    settings = get_settings()
+    _check_job_secret(request, authorization, settings)
+    from app.hr_notify import notify_hr_text
+    from app.sourcing.hh_sync import sync_hh_responses
+
+    result = await sync_hh_responses(settings, llm_router)
+    if result.get("imported") and tg_client and settings.is_hr_notify_configured:
+        await notify_hr_text(
+            settings,
+            tg_client,
+            "📥 Новые отклики HH",
+            f"Импортировано: {result['imported']}\nПропущено: {result['skipped']}",
+        )
+    return result
 
 
 @app.get("/admin/stats")
@@ -223,13 +292,5 @@ async def admin_slots(authorization: str = Header(default="")):
     if settings.admin_token:
         if authorization.replace("Bearer ", "").strip() != settings.admin_token:
             raise HTTPException(403, "Forbidden")
-    slots = available_slots(tz_name=settings.bot_timezone)
-    if gcal_client and gcal_client.available:
-        from datetime import datetime, timedelta
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo(settings.bot_timezone)
-        now = datetime.now(tz)
-        busy = gcal_client.get_busy_slots(now, now + timedelta(days=7))
-        slots = gcal_client.filter_available_slots(slots, busy)
+    slots = bookable_slots(tz_name=settings.bot_timezone, gcal=gcal_client)
     return [{"id": s.slot_id, "label_ru": s.label_ru, "starts_at": s.starts_at.isoformat()} for s in slots]

@@ -4,7 +4,6 @@ from enum import StrEnum
 
 
 class State(StrEnum):
-    CHOOSE_VIEW = "choose_view"
     CHOOSE_LANG = "choose_lang"
     GREETING = "greeting"
     COLLECT_NAME_AGE = "collect_name_age"

@@ -16,7 +16,7 @@ from app.ai.router import LLMRouter
 from app.bot.engine import BotEngine
 from app.bot.handlers import handle_telegram_update
 from app.config import get_settings
-from app.storage.db import store
+from app.storage import store
 from app.telegram_api import TelegramClient
 
 logging.basicConfig(level=logging.INFO)

@@ -11,31 +11,34 @@ from app.bot.extractors import classify_intent, interpret_step_answer
 from app.bot.semantic import StepContext
 from app.bot.profile_validate import (
     ValidationResult,
-    age_over_limit,
-    parse_experience_answer,
-    parse_name_age,
-    parse_student_answer,
+    parse_experience_text,
+    parse_job_search_answer,
+    parse_name,
 )
 from app.bot.channel_ui import (
     is_whatsapp_ui,
     parse_lang_choice,
-    parse_view_choice,
     slot_index_choice,
     wa_main_menu_text,
     wa_reminder_text,
     wa_slots_text,
 )
-from app.bot.faq import answer_faq
+from app.bot.faq import answer_faq, faq_by_topic
 from app.bot import content_boot as BOOT
 from app.bot.keyboards import (
-    channel_view_keyboard,
+    confirm_keyboard,
+    faq_keyboard,
+    faq_topics_keyboard,
+    handoff_keyboard,
     language_keyboard,
     main_menu_keyboard,
     reminder_keyboard,
+    resume_prompt_keyboard,
     slots_keyboard,
+    step_nav_keyboard,
     yes_no_keyboard,
 )
-from app.bot.scheduling import format_slot_label, slot_by_id
+from app.bot.scheduling import bookable_slots, format_slot_label, slot_by_id
 from app.bot.screening import (
     RejectReason,
     detect_city,
@@ -48,7 +51,8 @@ from app.bot.screening import (
 from app.bot.states import State
 from app.config import Settings
 from app.hr_notify import notify_hr
-from app.storage.db import Session, store
+from app.bot.outbound import update_panel
+from app.storage import Session, store
 from app.telegram_api import TelegramClient, detect_message_lang
 
 logger = logging.getLogger(__name__)
@@ -56,10 +60,15 @@ logger = logging.getLogger(__name__)
 CB_SCHEDULE = "act:schedule"
 CB_FAQ = "act:faq"
 CB_MENU = "act:menu"
-CB_VIEW_TG = "view:telegram"
-CB_VIEW_WA = "view:whatsapp"
 CB_LANG_KK = "lang:kk"
 CB_LANG_RU = "lang:ru"
+
+TEXT_INPUT_STATES = frozenset(
+    {
+        State.COLLECT_NAME_AGE.value,
+        State.COLLECT_EXPERIENCE.value,
+    }
+)
 
 
 @dataclass
@@ -84,12 +93,28 @@ def _begin_step(session: Session) -> None:
     session.clarify_attempts = 0
 
 
+def _normalize_legacy_session(session: Session) -> None:
+    if session.state == "choose_view":
+        session.state = State.CHOOSE_LANG.value
+        session.profile["ui_mode"] = "telegram"
+
+
+def _is_text_input_state(state: str) -> bool:
+    return state in TEXT_INPUT_STATES
+
+
 class BotEngine:
     def __init__(self, settings: Settings, together, tg: TelegramClient, gcal=None):
         self.settings = settings
         self.together = together
         self.tg = tg
         self.gcal = gcal
+
+    def _bookable_slots(self):
+        return bookable_slots(tz_name=self.settings.bot_timezone, gcal=self.gcal)
+
+    def _slots_kb(self, lang: str):
+        return slots_keyboard(lang, self.settings.bot_timezone, slots=self._bookable_slots())
 
     async def handle(
         self,
@@ -98,28 +123,32 @@ class BotEngine:
         is_callback: bool = False,
     ) -> EngineReply:
         t = (text or "").strip()
-        if session.state in (State.CHOOSE_VIEW.value, State.CHOOSE_LANG.value) and not session.profile.get(
-            "lang_locked"
-        ):
+        _normalize_legacy_session(session)
+        if session.state == State.CHOOSE_LANG.value and not session.profile.get("lang_locked"):
             lang = session.lang or "kk"
         else:
             lang = session.lang or detect_message_lang(text) or "kk"
             session.lang = lang
 
         if t in ("/start", "/reset"):
-            session.state = State.CHOOSE_VIEW.value
-            session.profile = {}
+            session.state = State.CHOOSE_LANG.value
+            session.profile = {"ui_mode": "telegram"}
             session.clarify_attempts = 0
             session.status = "new"
-            await store.save_session(session)
             session.lang = "kk"
-            return self._choose_view_reply(stat="started")
+            await store.save_session(session)
+            return self._start_reply(stat="started")
 
         if t == "/human":
             session.state = State.HANDOFF_HR.value
             session.status = "handoff"
             await store.save_session(session)
-            return EngineReply(_c(lang).HANDOFF, notify_hr="handoff", stat="handoff")
+            return EngineReply(
+                _c(lang).HANDOFF,
+                reply_markup=_markup(session, handoff_keyboard(lang)),
+                notify_hr="handoff",
+                stat="handoff",
+            )
 
         if is_callback:
             return await self._handle_callback(session, t, lang)
@@ -127,35 +156,30 @@ class BotEngine:
         state = session.state
 
         if state in (State.REJECTED.value, State.CLOSED.value, State.HANDOFF_HR.value):
-            intent = await classify_intent(t, self.together)
-            if intent == "faq":
-                ans = await answer_faq(t, lang, self.together)
-                if ans:
-                    return EngineReply(ans)
-            return EngineReply(_c(lang).HANDOFF if state == State.HANDOFF_HR.value else _c(lang).DB_TOUCH)
+            return await self._prompt_for_state(session, lang, hint=True)
 
-        if state == State.CHOOSE_VIEW.value:
-            choice = parse_view_choice(t)
-            if choice:
-                return await self._apply_view_choice(session, choice)
-            return self._choose_view_reply(stat=None)
+        if not _is_text_input_state(state):
+            if state in (
+                State.WELCOME_QUALIFIED.value,
+                State.QA.value,
+                State.SCHEDULE_INTERVIEW.value,
+                State.CONFIRM.value,
+            ):
+                return await self._prompt_for_state(session, lang, hint=True)
+            if state == State.CHOOSE_LANG.value:
+                lchoice = parse_lang_choice(t)
+                if lchoice:
+                    return await self._apply_lang_choice(session, lchoice)
+                return await self._prompt_for_state(session, lang, hint=bool(t))
+            if state == State.COLLECT_STUDENT.value:
+                return await self._prompt_for_state(session, lang, hint=bool(t))
+            if t and not t.startswith("/"):
+                return await self._prompt_for_state(session, lang, hint=True)
 
-        if state == State.CHOOSE_LANG.value:
-            lchoice = parse_lang_choice(t)
-            if lchoice:
-                return await self._apply_lang_choice(session, lchoice)
-            return self._choose_lang_reply(session)
-
-        if state in (State.GREETING.value, State.COLLECT_NAME_AGE.value):
-            if state == State.GREETING.value:
-                session.state = State.COLLECT_NAME_AGE.value
-                await store.save_session(session)
-                if not t or t.startswith("/"):
-                    return self._ask_name_age(session, lang)
+        if state == State.COLLECT_NAME_AGE.value:
+            if not t or t.startswith("/"):
+                return self._ask_name_age(session, lang)
             return await self._collect_name_age(session, t, lang)
-
-        if state == State.COLLECT_STUDENT.value:
-            return await self._collect_student(session, t, lang)
 
         if state == State.COLLECT_EXPERIENCE.value:
             return await self._collect_experience(session, t, lang)
@@ -183,43 +207,99 @@ class BotEngine:
             State.SCHEDULE_INTERVIEW.value,
             State.CONFIRM.value,
         ):
-            return await self._post_qualify(session, t, lang)
+            return await self._prompt_for_state(session, lang, hint=True)
 
-        if not session.profile.get("ui_mode"):
-            return self._choose_view_reply()
+        session.profile.setdefault("ui_mode", "telegram")
         if not session.profile.get("lang_locked"):
-            return self._choose_lang_reply(session)
+            return self._start_reply()
         return EngineReply(_c(lang).GREETING)
 
-    def _choose_view_reply(self, stat: str | None = None) -> EngineReply:
+    def _start_reply(self, stat: str | None = None) -> EngineReply:
         return EngineReply(
-            BOOT.CHOOSE_VIEW,
-            reply_markup=channel_view_keyboard("kk"),
+            BOOT.WELCOME_START,
+            reply_markup=language_keyboard(),
             stat=stat,
         )
 
     def _choose_lang_reply(self, session: Session) -> EngineReply:
         kb = None if is_whatsapp_ui(session) else language_keyboard()
-        return EngineReply(BOOT.CHOOSE_LANG, reply_markup=kb)
-
-    async def _apply_view_choice(self, session: Session, mode: str) -> EngineReply:
-        session.profile["ui_mode"] = mode
-        session.state = State.CHOOSE_LANG.value
-        session.clarify_attempts = 0
-        await store.save_session(session)
-        await store.bump_stat(f"view_{mode}")
-        intro = BOOT.VIEW_WHATSAPP_OK if mode == "whatsapp" else BOOT.VIEW_TELEGRAM_OK
-        return EngineReply(f"{intro}\n\n{BOOT.CHOOSE_LANG}", reply_markup=_markup(session, language_keyboard()))
+        return EngineReply(BOOT.WELCOME_START, reply_markup=kb)
 
     async def _apply_lang_choice(self, session: Session, lang: str) -> EngineReply:
         session.lang = lang
         session.profile["lang_locked"] = True
+        session.profile["ui_mode"] = "telegram"
         session.state = State.COLLECT_NAME_AGE.value
         session.clarify_attempts = 0
         await store.save_session(session)
         await store.bump_stat(f"lang_{lang}")
-        intro = _c(lang).VIEW_WHATSAPP_OK if is_whatsapp_ui(session) else _c(lang).VIEW_TELEGRAM_OK
-        return EngineReply(f"{intro}\n\n{_c(lang).INTRO_VACANCY}\n\n{_c(lang).ASK_NAME_AGE}")
+        kb = step_nav_keyboard(lang, back="act:change_lang")
+        return EngineReply(
+            f"{_c(lang).INTRO_VACANCY}\n\n{_c(lang).ASK_NAME}",
+            reply_markup=_markup(session, kb),
+        )
+
+    async def _prompt_for_state(self, session: Session, lang: str, *, hint: bool = False) -> EngineReply:
+        c = _c(lang)
+        prefix = f"{c.USE_BUTTONS}\n\n" if hint else ""
+        state = session.state
+
+        if state == State.CHOOSE_LANG.value:
+            return EngineReply(prefix + BOOT.WELCOME_START, reply_markup=_markup(session, language_keyboard()))
+
+        if state == State.COLLECT_STUDENT.value:
+            return EngineReply(
+                prefix + c.ASK_JOB_SEARCH,
+                reply_markup=_markup(session, yes_no_keyboard(lang, "job")),
+            )
+
+        if state == State.COLLECT_EXPERIENCE.value:
+            return EngineReply(
+                prefix + c.ASK_EXPERIENCE,
+                reply_markup=_markup(session, step_nav_keyboard(lang, back="act:back_job")),
+            )
+
+        if state in (State.WELCOME_QUALIFIED.value, State.QA.value):
+            session.state = State.WELCOME_QUALIFIED.value
+            await store.save_session(session)
+            return EngineReply(
+                prefix + c.welcome_qualified(session.profile.get("name", "")),
+                reply_markup=_markup(session, main_menu_keyboard(lang)),
+            )
+
+        if state == State.SCHEDULE_INTERVIEW.value:
+            return EngineReply(
+                prefix + c.ASK_INTERVIEW_TIME,
+                reply_markup=_markup(session, self._slots_kb(lang)),
+            )
+
+        if state == State.CONFIRM.value:
+            name = session.profile.get("name", "")
+            label = session.interview_label or "—"
+            return EngineReply(
+                prefix + c.confirm_visit(name, label),
+                reply_markup=_markup(session, confirm_keyboard(lang)),
+            )
+
+        if state == State.CLOSED.value:
+            return EngineReply(
+                prefix + c.NOT_LOOKING,
+                reply_markup=_markup(session, handoff_keyboard(lang)),
+            )
+
+        if state in (State.REJECTED.value, State.HANDOFF_HR.value):
+            text = c.HANDOFF if state == State.HANDOFF_HR.value else c.DB_TOUCH
+            return EngineReply(prefix + text, reply_markup=_markup(session, handoff_keyboard(lang)))
+
+        if session.profile.get("awaiting_resume"):
+            return EngineReply(
+                prefix + c.ASK_RESUME_UPLOAD,
+                reply_markup=_markup(session, resume_prompt_keyboard(lang)),
+            )
+
+        if not session.profile.get("lang_locked"):
+            return self._start_reply()
+        return EngineReply(prefix + c.GREETING, reply_markup=_markup(session, main_menu_keyboard(lang)))
 
     def _err(self, lang: str, key: str) -> str:
         c = _c(lang)
@@ -231,10 +311,14 @@ class BotEngine:
             "age_young": c.ERR_AGE_YOUNG,
             "age_invalid": c.ERR_AGE_INVALID,
             "yes_no_unclear": c.ERR_YES_NO,
+            "experience_short": c.ERR_EXPERIENCE_SHORT,
         }.get(key, c.ERR_GARBAGE)
 
     def _ask_name_age(self, session: Session, lang: str) -> EngineReply:
-        return EngineReply(_c(lang).ASK_NAME_AGE)
+        return EngineReply(
+            _c(lang).ASK_NAME,
+            reply_markup=_markup(session, step_nav_keyboard(lang, back="act:change_lang")),
+        )
 
     async def _retry_invalid(
         self, session: Session, lang: str, step_prompt: str, err_key: str, keyboard: dict | None = None
@@ -243,7 +327,12 @@ class BotEngine:
         if session.clarify_attempts >= self.settings.fallback_attempts_max:
             session.state = State.HANDOFF_HR.value
             await store.save_session(session)
-            return EngineReply(_c(lang).HANDOFF, notify_hr="handoff", stat="handoff")
+            return EngineReply(
+                _c(lang).HANDOFF,
+                reply_markup=_markup(session, handoff_keyboard(lang)),
+                notify_hr="handoff",
+                stat="handoff",
+            )
         await store.save_session(session)
         return EngineReply(
             f"{self._err(lang, err_key)}\n\n{step_prompt}",
@@ -251,78 +340,73 @@ class BotEngine:
         )
 
     async def _collect_name_age(self, session: Session, text: str, lang: str) -> EngineReply:
-        result = parse_name_age(text)
+        result = parse_name(text)
         if not result.ok:
-            return await self._retry_invalid(session, lang, _c(lang).ASK_NAME_AGE, result.error_key or "garbage")
+            return await self._retry_invalid(session, lang, _c(lang).ASK_NAME, result.error_key or "garbage")
 
-        data = result.data or {}
-        age = int(data["age"])
-        if age_over_limit(age):
-            from app.bot.screening import RejectReason
-
-            return await self._reject(session, RejectReason("age", _c(lang).REJECT_AGE))
-
-        session.profile["name"] = data["name"]
-        session.profile["age"] = age
+        session.profile["name"] = result.data["name"]
         _begin_step(session)
         session.state = State.COLLECT_STUDENT.value
         await store.save_session(session)
-        kb = yes_no_keyboard(lang, "stu")
-        body = f"{_c(lang).CONFIRM_STEP}\n\n{_c(lang).ASK_STUDENT}"
+        kb = yes_no_keyboard(lang, "job")
+        body = f"{_c(lang).CONFIRM_STEP}\n\n{_c(lang).ASK_JOB_SEARCH}"
         return EngineReply(body, reply_markup=_markup(session, kb))
 
     async def _collect_student(self, session: Session, text: str, lang: str) -> EngineReply:
-        result = parse_student_answer(text)
+        result = parse_job_search_answer(text)
         if not result.ok:
             return await self._retry_invalid(
                 session,
                 lang,
-                _c(lang).ASK_STUDENT,
+                _c(lang).ASK_JOB_SEARCH,
                 result.error_key or "yes_no_unclear",
-                yes_no_keyboard(lang, "stu"),
+                yes_no_keyboard(lang, "job"),
             )
-        session.profile["is_student"] = result.data["is_student"]
+        active = result.data["job_search_active"]
+        session.profile["job_search_active"] = active
+        if not active:
+            session.state = State.CLOSED.value
+            session.status = "not_looking"
+            await store.save_session(session)
+            return EngineReply(
+                _c(lang).NOT_LOOKING,
+                reply_markup=_markup(session, handoff_keyboard(lang)),
+                stat="not_looking",
+            )
         _begin_step(session)
         session.state = State.COLLECT_EXPERIENCE.value
         await store.save_session(session)
-        kb = yes_no_keyboard(lang, "exp")
-        body = f"{_c(lang).CONFIRM_STEP}\n\n{_c(lang).ASK_EXPERIENCE}"
-        return EngineReply(body, reply_markup=_markup(session, kb))
+        return EngineReply(
+            f"{_c(lang).CONFIRM_STEP}\n\n{_c(lang).ASK_EXPERIENCE}",
+            reply_markup=_markup(session, step_nav_keyboard(lang, back="act:back_job")),
+        )
 
     async def _collect_experience(self, session: Session, text: str, lang: str) -> EngineReply:
-        result = parse_experience_answer(text)
+        result = parse_experience_text(text)
         if not result.ok:
             return await self._retry_invalid(
                 session,
                 lang,
                 _c(lang).ASK_EXPERIENCE,
-                result.error_key or "yes_no_unclear",
-                yes_no_keyboard(lang, "exp"),
+                result.error_key or "garbage",
+                step_nav_keyboard(lang, back="act:back_job"),
             )
-        session.profile["has_experience"] = result.data["has_experience"]
+        session.profile["experience_summary"] = result.data["experience_summary"]
         _begin_step(session)
-        await store.save_session(session)
-        return await self._after_profile_collected(session, lang)
+        return await self._qualify(session, lang)
 
     async def _after_profile_collected(self, session: Session, lang: str) -> EngineReply:
-        from app.bot.screening import screen_profile
-
-        reject = screen_profile(session.profile, lang)
-        if reject:
-            return await self._reject(session, reject)
-        session.state = State.COLLECT_CITY.value
-        await store.save_session(session)
-        return EngineReply(f"{_c(lang).CONFIRM_STEP}\n\n{_c(lang).ASK_CITY}")
+        return await self._qualify(session, lang)
 
     async def _handle_callback(self, session: Session, data: str, lang: str) -> EngineReply:
-        if data.startswith("stu:"):
+        if data.startswith("job:") or data.startswith("stu:"):
             val = data.endswith(":yes")
             fake = "1" if val else "2"
             if session.state == State.COLLECT_STUDENT.value:
                 return await self._collect_student(session, fake, lang)
         if data.startswith("exp:"):
             val = data.endswith(":yes")
-            fake = "1" if val else "2"
+            fake = "да" if val else "нет"
             if session.state == State.COLLECT_EXPERIENCE.value:
                 return await self._collect_experience(session, fake, lang)
 
@@ -336,14 +420,58 @@ class BotEngine:
             if session.state == State.COLLECT_LANGUAGE.value:
                 return await self._collect_language(session, fake, lang)
 
-        if data == CB_VIEW_TG:
-            return await self._apply_view_choice(session, "telegram")
-        if data == CB_VIEW_WA:
-            return await self._apply_view_choice(session, "whatsapp")
+        if data.startswith("view:"):
+            session.state = State.CHOOSE_LANG.value
+            session.profile = {"ui_mode": "telegram"}
+            session.clarify_attempts = 0
+            session.status = "new"
+            session.lang = "kk"
+            await store.save_session(session)
+            return self._start_reply(stat="restarted")
+
         if data == CB_LANG_KK:
             return await self._apply_lang_choice(session, "kk")
         if data == CB_LANG_RU:
             return await self._apply_lang_choice(session, "ru")
+
+        if data.startswith("faq:"):
+            topic = data[4:]
+            ans = faq_by_topic(topic, lang) or _c(lang).FAQ_JOB
+            session.state = State.QA.value
+            session.profile.pop("awaiting_resume", None)
+            await store.save_session(session)
+            return EngineReply(ans, reply_markup=_markup(session, faq_topics_keyboard(lang)))
+
+        if data == "act:resume":
+            session.profile["awaiting_resume"] = True
+            if session.profile.get("lang_locked"):
+                session.state = State.WELCOME_QUALIFIED.value
+            await store.save_session(session)
+            return EngineReply(
+                _c(lang).ASK_RESUME_UPLOAD,
+                reply_markup=_markup(session, resume_prompt_keyboard(lang)),
+            )
+
+        if data == "act:change_lang":
+            session.profile.pop("lang_locked", None)
+            session.state = State.CHOOSE_LANG.value
+            session.clarify_attempts = 0
+            await store.save_session(session)
+            return self._start_reply()
+
+        if data == "act:back_name":
+            session.state = State.COLLECT_NAME_AGE.value
+            session.profile.pop("name", None)
+            session.clarify_attempts = 0
+            await store.save_session(session)
+            return self._ask_name_age(session, lang)
+
+        if data == "act:back_job":
+            session.state = State.COLLECT_STUDENT.value
+            session.profile.pop("job_search_active", None)
+            session.clarify_attempts = 0
+            await store.save_session(session)
+            return await self._prompt_for_state(session, lang)
 
         if is_whatsapp_ui(session) and data.startswith(("act:", "slot:", "rem:")):
             if data == CB_SCHEDULE:
@@ -361,15 +489,22 @@ class BotEngine:
             await store.save_session(session)
             return EngineReply(
                 _c(lang).ASK_INTERVIEW_TIME,
-                reply_markup=_markup(session, slots_keyboard(lang, self.settings.bot_timezone)),
+                reply_markup=_markup(session, self._slots_kb(lang)),
             )
 
         if data == CB_FAQ:
             session.state = State.QA.value
+            session.profile.pop("awaiting_resume", None)
             await store.save_session(session)
-            return EngineReply(_c(lang).FAQ_JOB)
+            return EngineReply(
+                _c(lang).FAQ_PICK_TOPIC,
+                reply_markup=_markup(session, faq_topics_keyboard(lang)),
+            )
 
         if data == CB_MENU:
+            session.profile.pop("awaiting_resume", None)
+            session.state = State.WELCOME_QUALIFIED.value
+            await store.save_session(session)
             text = _c(lang).welcome_qualified(session.profile.get("name", ""))
             if is_whatsapp_ui(session):
                 text += f"\n\n{wa_main_menu_text(lang)}"
@@ -380,11 +515,11 @@ class BotEngine:
 
         if data.startswith("slot:"):
             sid = data[5:]
-            slot = slot_by_id(sid, tz_name=self.settings.bot_timezone)
+            slot = slot_by_id(sid, tz_name=self.settings.bot_timezone, gcal=self.gcal)
             if not slot:
                 return EngineReply(
                     _c(lang).ASK_INTERVIEW_TIME,
-                    reply_markup=_markup(session, slots_keyboard(lang, self.settings.bot_timezone)),
+                    reply_markup=_markup(session, self._slots_kb(lang)),
                 )
             session.interview_at = int(slot.starts_at.timestamp())
             session.interview_label = format_slot_label(slot, lang)
@@ -409,12 +544,21 @@ class BotEngine:
             name = session.profile.get("name", "")
             return EngineReply(
                 _c(lang).confirm_visit(name, session.interview_label),
+                reply_markup=_markup(session, confirm_keyboard(lang)),
                 notify_hr="scheduled",
                 stat="scheduled",
             )
 
         if data == "rem:yes":
-            return EngineReply("✅" if lang == "kk" else "✅ Отлично, ждём вас!")
+            session.interview_confirmed = True
+            session.status = "confirmed"
+            await store.save_session(session)
+            body = "✅ Күтеміз!" if lang == "kk" else "✅ Отлично, ждём вас на собеседовании!"
+            return EngineReply(
+                body,
+                reply_markup=_markup(session, confirm_keyboard(lang)),
+                notify_hr="confirmed",
+            )
 
         if data == "rem:no":
             session.status = "no_show"
@@ -424,12 +568,34 @@ class BotEngine:
                 body += f"\n\n{wa_slots_text(lang, self.settings.bot_timezone)}"
             return EngineReply(
                 body,
-                reply_markup=_markup(session, slots_keyboard(lang, self.settings.bot_timezone)),
+                reply_markup=_markup(session, self._slots_kb(lang)),
                 notify_hr="no_show",
                 stat="no_show",
             )
 
-        return EngineReply(_c(lang).HANDOFF)
+        if data == "act:human" or data == "act:restart":
+            if data == "act:restart":
+                session.state = State.CHOOSE_LANG.value
+                session.profile = {"ui_mode": "telegram"}
+                session.clarify_attempts = 0
+                session.status = "new"
+                session.lang = "kk"
+                await store.save_session(session)
+                return self._start_reply(stat="restarted")
+            session.state = State.HANDOFF_HR.value
+            session.status = "handoff"
+            await store.save_session(session)
+            return EngineReply(
+                _c(lang).HANDOFF,
+                reply_markup=_markup(session, handoff_keyboard(lang)),
+                notify_hr="handoff",
+                stat="handoff",
+            )
+
+        return EngineReply(
+            _c(lang).HANDOFF,
+            reply_markup=_markup(session, handoff_keyboard(lang)),
+        )
 
     async def _collect_city(self, session: Session, text: str, lang: str) -> EngineReply:
         sem = await interpret_step_answer(
@@ -590,6 +756,7 @@ class BotEngine:
             name=session.profile.get("name"),
             vacancy_id=session.vacancy_id,
             profile=session.profile,
+            resume_text=session.profile.get("experience_summary"),
             status="qualified",
         )
         session.candidate_id = cid
@@ -608,9 +775,15 @@ class BotEngine:
     async def _reject(self, session: Session, reason: RejectReason) -> EngineReply:
         session.state = State.REJECTED.value
         session.status = "rejected"
+        lang = session.lang or "ru"
         await store.save_session(session)
         await store.bump_stat(f"reject_{reason.code}")
-        return EngineReply(reason.message, notify_hr="rejected", stat="rejected")
+        return EngineReply(
+            reason.message,
+            reply_markup=_markup(session, handoff_keyboard(lang)),
+            notify_hr="rejected",
+            stat="rejected",
+        )
 
     async def _post_qualify(self, session: Session, text: str, lang: str) -> EngineReply:
         if is_whatsapp_ui(session):
@@ -628,7 +801,7 @@ class BotEngine:
                 body += f"\n\n{wa_slots_text(lang, self.settings.bot_timezone)}"
             return EngineReply(
                 body,
-                reply_markup=_markup(session, slots_keyboard(lang, self.settings.bot_timezone)),
+                reply_markup=_markup(session, self._slots_kb(lang)),
             )
 
         if intent == "reschedule":
@@ -637,16 +810,22 @@ class BotEngine:
                 body += f"\n\n{wa_slots_text(lang, self.settings.bot_timezone)}"
             return EngineReply(
                 body,
-                reply_markup=_markup(session, slots_keyboard(lang, self.settings.bot_timezone)),
+                reply_markup=_markup(session, self._slots_kb(lang)),
             )
 
         if "ертерек" in text.lower() or "раньше" in text.lower() or "маңда" in text.lower():
-            return EngineReply(_c(lang).EARLY_ARRIVAL)
+            return EngineReply(
+                _c(lang).EARLY_ARRIVAL,
+                reply_markup=_markup(session, confirm_keyboard(lang)),
+            )
 
         if any(x in text.lower() for x in ("мин", "сағ", "час", "15", "10")):
             if session.state != State.CONFIRM.value:
                 pass
-            return EngineReply(_c(lang).EARLY_OK)
+            return EngineReply(
+                _c(lang).EARLY_OK,
+                reply_markup=_markup(session, confirm_keyboard(lang)),
+            )
 
         ans = await answer_faq(text, lang, self.together)
         if ans:
@@ -662,7 +841,11 @@ class BotEngine:
         if session.clarify_attempts >= self.settings.fallback_attempts_max:
             session.state = State.HANDOFF_HR.value
             await store.save_session(session)
-            return EngineReply(_c(lang).HANDOFF, notify_hr="handoff")
+            return EngineReply(
+                _c(lang).HANDOFF,
+                reply_markup=_markup(session, handoff_keyboard(lang)),
+                notify_hr="handoff",
+            )
         tail = f"\n\n{wa_main_menu_text(lang)}" if is_whatsapp_ui(session) else ""
         return EngineReply(
             _c(lang).FAQ_JOB + tail,
@@ -720,36 +903,48 @@ class BotEngine:
                 kb = reminder_keyboard(lang)
                 if is_whatsapp_ui(s):
                     body += f"\n\n{wa_reminder_text(lang)}"
-                    kb = None
-                await self.tg.send_message(
-                    s.chat_id,
-                    body,
-                    reply_markup=kb,
-                )
+                    await self.tg.send_message(s.chat_id, body)
+                else:
+                    await update_panel(self.tg, s, s.chat_id, body, kb)
+                    await store.save_session(s)
                 s.reminder_24_sent = True
                 await store.save_session(s)
+                await notify_hr(
+                    self.settings,
+                    self.tg,
+                    s,
+                    "reminder_24",
+                    extra=f"Кандидат: {s.profile.get('name', '—')}\nВизит: {s.interview_label or '—'}",
+                )
                 sent += 1
             elif 3300 <= delta <= 4200 and not s.reminder_1_sent:
                 body = c.REMINDER_1H if hasattr(c, "REMINDER_1H") else c.REMINDER_2H
                 kb = reminder_keyboard(lang)
                 if is_whatsapp_ui(s):
                     body += f"\n\n{wa_reminder_text(lang)}"
-                    kb = None
-                await self.tg.send_message(s.chat_id, body, reply_markup=kb)
+                    await self.tg.send_message(s.chat_id, body)
+                else:
+                    await update_panel(self.tg, s, s.chat_id, body, kb)
+                    await store.save_session(s)
                 s.reminder_1_sent = True
                 await store.save_session(s)
+                await notify_hr(
+                    self.settings,
+                    self.tg,
+                    s,
+                    "reminder_1",
+                    extra=f"Кандидат: {s.profile.get('name', '—')}\nВизит: {s.interview_label or '—'}",
+                )
                 sent += 1
             elif 6600 <= delta <= 7800 and not s.reminder_2_sent:
                 body = c.REMINDER_2H
                 kb = reminder_keyboard(lang)
                 if is_whatsapp_ui(s):
                     body += f"\n\n{wa_reminder_text(lang)}"
-                    kb = None
-                await self.tg.send_message(
-                    s.chat_id,
-                    body,
-                    reply_markup=kb,
-                )
+                    await self.tg.send_message(s.chat_id, body)
+                else:
+                    await update_panel(self.tg, s, s.chat_id, body, kb)
+                    await store.save_session(s)
                 s.reminder_2_sent = True
                 await store.save_session(s)
                 sent += 1

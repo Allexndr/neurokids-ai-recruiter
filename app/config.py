@@ -48,8 +48,16 @@ class Settings(BaseSettings):
 
     database_path: str = Field(default_factory=_default_database_path)
     database_url: str = ""
+    mongodb_uri: str = Field(default="", validation_alias="MONGODB_URI")
+    mongodb_db_name: str = "hr_recruiter_bot"
+    blob_read_write_token: str = ""
+    blob_prefix: str = "botforbus-blob"
 
     fallback_attempts_max: int = 2
+
+    voice_chunk_seconds: int = 300
+    max_voice_duration_sec: int = 2400
+    max_voice_bytes: int = 20 * 1024 * 1024
 
     @property
     def telegram_webhook_url(self) -> str:
@@ -72,6 +80,10 @@ class Settings(BaseSettings):
         return bool(self.together_api_key)
 
     @property
+    def is_stt_configured(self) -> bool:
+        return bool(self.together_api_key or self.groq_api_key or self.openai_api_key)
+
+    @property
     def is_hr_notify_configured(self) -> bool:
         return bool(self.telegram_hr_chat_id and self.telegram_bot_token)
 
@@ -87,8 +99,21 @@ class Settings(BaseSettings):
     def is_google_calendar_configured(self) -> bool:
         return bool(self.google_calendar_id and self.google_service_account_json)
 
+    @property
+    def is_mongodb_configured(self) -> bool:
+        return bool(self.mongodb_uri)
+
+    @property
+    def is_blob_configured(self) -> bool:
+        return bool(self.blob_read_write_token)
+
+    @property
+    def hr_chat_ids(self) -> set[str]:
+        return {s.strip() for s in self.telegram_hr_chat_id.split(",") if s.strip()}
+
     def is_hr_chat(self, chat_id: str) -> bool:
-        return bool(self.telegram_hr_chat_id and str(chat_id) == str(self.telegram_hr_chat_id))
+        ids = self.hr_chat_ids
+        return bool(ids) and str(chat_id) in ids
 
 
 @lru_cache

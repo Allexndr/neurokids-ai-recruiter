@@ -20,54 +20,76 @@ def engine():
 
 
 @pytest.mark.asyncio
-async def test_reject_old_candidate(engine):
+async def test_old_age_not_rejected(engine):
     session = Session(
         chat_id="1",
         state=State.COLLECT_NAME_AGE.value,
-        lang="kk",
+        lang="ru",
         profile={"ui_mode": "telegram", "lang_locked": True},
     )
-    reply = await engine.handle(session, "Данияр, 32, жоқ, жоқ")
-    assert session.state == State.REJECTED.value
-    assert "30" in reply.text
+    reply = await engine.handle(session, "Данияр")
+    assert session.state == State.COLLECT_STUDENT.value
+    assert session.profile.get("name") == "Данияр"
+    assert "Атаман" not in reply.text
+    assert reply.reply_markup is not None
 
 
 @pytest.mark.asyncio
-async def test_step_by_step_profile(engine):
+async def test_step_by_step_tz_flow(engine):
     session = Session(
         chat_id="2",
         state=State.COLLECT_NAME_AGE.value,
         lang="ru",
-        profile={"ui_mode": "whatsapp", "lang_locked": True},
+        profile={"ui_mode": "telegram", "lang_locked": True},
     )
-    await engine.handle(session, "Айым, 25")
-    assert session.profile.get("age") == 25
+    await engine.handle(session, "Айым")
+    assert session.profile.get("name") == "Айым"
     assert session.state == State.COLLECT_STUDENT.value
-    await engine.handle(session, "2")
-    assert session.profile.get("is_student") is False
-    await engine.handle(session, "2")
-    assert session.profile.get("has_experience") is False
-    assert session.state == State.COLLECT_CITY.value
+    await engine.handle(session, "job:yes", is_callback=True)
+    assert session.profile.get("job_search_active") is True
+    assert session.state == State.COLLECT_EXPERIENCE.value
+    reply = await engine.handle(session, "3 года в продажах, CRM, хочу в HR")
+    assert session.state == State.WELCOME_QUALIFIED.value
+    assert "Neurokids" in reply.text
+    assert reply.reply_markup is not None
 
 
 @pytest.mark.asyncio
-async def test_language_svobodno_qualifies(engine):
+async def test_not_looking_closes(engine):
     session = Session(
         chat_id="3",
-        state=State.COLLECT_LANGUAGE.value,
+        state=State.COLLECT_STUDENT.value,
         lang="ru",
-        profile={
-            "ui_mode": "telegram",
-            "lang_locked": True,
-            "name": "Айым",
-            "age": 25,
-            "is_student": False,
-            "has_experience": False,
-            "city": "almaty",
-            "schedule_ok": True,
-        },
+        profile={"ui_mode": "telegram", "lang_locked": True, "name": "Test"},
     )
-    reply = await engine.handle(session, "свободно")
-    assert session.profile.get("language_ok") is True
-    assert session.state != State.REJECTED.value
-    assert "не подходите" not in reply.text.lower()
+    reply = await engine.handle(session, "job:no", is_callback=True)
+    assert session.state == State.CLOSED.value
+    assert session.profile.get("job_search_active") is False
+    assert reply.reply_markup is not None
+
+
+@pytest.mark.asyncio
+async def test_menu_text_shows_buttons_not_commands(engine):
+    session = Session(
+        chat_id="4",
+        state=State.WELCOME_QUALIFIED.value,
+        lang="ru",
+        profile={"ui_mode": "telegram", "lang_locked": True, "name": "Айым"},
+    )
+    reply = await engine.handle(session, "привет")
+    assert "Neurokids" in reply.text
+    assert reply.reply_markup is not None
+    assert "act:schedule" in str(reply.reply_markup)
+
+
+@pytest.mark.asyncio
+async def test_faq_topic_callback(engine):
+    session = Session(
+        chat_id="5",
+        state=State.WELCOME_QUALIFIED.value,
+        lang="ru",
+        profile={"ui_mode": "telegram", "lang_locked": True, "name": "Айым"},
+    )
+    reply = await engine.handle(session, "faq:salary", is_callback=True)
+    assert "собеседован" in reply.text.lower() or "hr" in reply.text.lower()
+    assert "faq:schedule" in str(reply.reply_markup)

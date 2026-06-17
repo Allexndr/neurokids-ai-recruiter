@@ -13,7 +13,7 @@ from app.config import get_settings
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     chat_id TEXT PRIMARY KEY,
-    state TEXT NOT NULL DEFAULT 'choose_view',
+    state TEXT NOT NULL DEFAULT 'choose_lang',
     lang TEXT NOT NULL DEFAULT 'ru',
     profile_json TEXT NOT NULL DEFAULT '{}',
     clarify_attempts INTEGER NOT NULL DEFAULT 0,
@@ -95,6 +95,26 @@ CREATE TABLE IF NOT EXISTS interview_analysis (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS voice_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    duration_sec INTEGER NOT NULL DEFAULT 0,
+    file_size INTEGER NOT NULL DEFAULT 0,
+    mime_hint TEXT NOT NULL DEFAULT 'ogg',
+    candidate_id INTEGER,
+    contact_name TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    total_chunks INTEGER NOT NULL DEFAULT 1,
+    parts_json TEXT NOT NULL DEFAULT '[]',
+    error TEXT,
+    audio_blob_url TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_jobs_status ON voice_jobs(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_interview ON sessions(interview_at);
 CREATE INDEX IF NOT EXISTS idx_candidates_vacancy ON candidates(vacancy_id);
 CREATE INDEX IF NOT EXISTS idx_candidates_score ON candidates(match_score);
@@ -152,6 +172,29 @@ class Candidate:
     updated_at: int = 0
 
 
+@dataclass
+class VoiceJob:
+    id: int
+    chat_id: str
+    file_id: str
+    duration_sec: int = 0
+    file_size: int = 0
+    mime_hint: str = "ogg"
+    candidate_id: int | None = None
+    contact_name: str | None = None
+    status: str = "pending"
+    chunk_index: int = 0
+    total_chunks: int = 1
+    parts: list[str] = field(default_factory=list)
+    error: str | None = None
+    audio_blob_url: str | None = None
+    created_at: int = 0
+    updated_at: int = 0
+
+    def full_transcript(self) -> str:
+        return "\n\n".join(p.strip() for p in self.parts if p and p.strip())
+
+
 class Store:
     def __init__(self, path: str):
         self.path = path
@@ -181,6 +224,11 @@ class Store:
             if col not in cols:
                 await conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typedef}")
 
+        cur = await conn.execute("PRAGMA table_info(voice_jobs)")
+        vcols = {row[1] for row in await cur.fetchall()}
+        if vcols and "audio_blob_url" not in vcols:
+            await conn.execute("ALTER TABLE voice_jobs ADD COLUMN audio_blob_url TEXT")
+
     async def get_session(self, chat_id: str) -> Session:
         await self.init()
         async with aiosqlite.connect(self.path) as conn:
@@ -188,7 +236,7 @@ class Store:
             cur = await conn.execute("SELECT * FROM sessions WHERE chat_id = ?", (chat_id,))
             row = await cur.fetchone()
         if not row:
-            return Session(chat_id=chat_id, state="choose_view", updated_at=int(time.time()))
+            return Session(chat_id=chat_id, state="choose_lang", updated_at=int(time.time()))
         return self._row_to_session(row)
 
     def _row_to_session(self, row: aiosqlite.Row) -> Session:
@@ -246,7 +294,7 @@ class Store:
             await conn.commit()
 
     async def reset_session(self, chat_id: str) -> Session:
-        s = Session(chat_id=chat_id, state="choose_view", updated_at=int(time.time()))
+        s = Session(chat_id=chat_id, state="choose_lang", updated_at=int(time.time()))
         await self.save_session(s)
         return s
 
@@ -442,6 +490,66 @@ class Store:
             rows = await cur.fetchall()
         return [self._row_to_candidate(r) for r in rows]
 
+    async def find_candidate_by_external(self, source: str, external_id: str) -> Candidate | None:
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT * FROM candidates WHERE source = ? AND external_id = ? LIMIT 1",
+                (source, external_id),
+            )
+            row = await cur.fetchone()
+        return self._row_to_candidate(row) if row else None
+
+    async def add_hr_comment(self, candidate_id: int, text: str) -> bool:
+        await self.init()
+        c = await self.get_candidate(candidate_id)
+        if not c:
+            return False
+        now = int(time.time())
+        profile = dict(c.profile or {})
+        comments = list(profile.get("hr_comments") or [])
+        comments.append({"text": text.strip(), "at": now})
+        profile["hr_comments"] = comments[-50:]
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE candidates SET profile_json=?, updated_at=? WHERE id=?",
+                (json.dumps(profile, ensure_ascii=False), now, candidate_id),
+            )
+            await conn.commit()
+        return True
+
+    async def set_vacancy_hh_id(self, vacancy_id: int, hh_vacancy_id: str) -> bool:
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE vacancies SET hh_vacancy_id=? WHERE id=?",
+                (hh_vacancy_id.strip(), vacancy_id),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def get_latest_interview_analysis(self, candidate_id: int) -> dict | None:
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """SELECT transcript, summary, profile_json, created_at
+                   FROM interview_analysis WHERE candidate_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (candidate_id,),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        profile = json.loads(row["profile_json"] or "{}")
+        return {
+            "transcript": row["transcript"],
+            "summary": row["summary"],
+            "profile": profile,
+            "created_at": row["created_at"],
+        }
+
     # --- Interviews & analysis ---
 
     async def create_interview(self, candidate_id: int, scheduled_at: int, calendar_event_id: str | None = None) -> int:
@@ -480,6 +588,130 @@ class Store:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    # --- Voice jobs (long audio transcription) ---
 
-_settings = get_settings()
-store = Store(_settings.database_path)
+    def _row_to_voice_job(self, row: aiosqlite.Row) -> VoiceJob:
+        return VoiceJob(
+            id=row["id"],
+            chat_id=row["chat_id"],
+            file_id=row["file_id"],
+            duration_sec=row["duration_sec"],
+            file_size=row["file_size"],
+            mime_hint=row["mime_hint"] or "ogg",
+            candidate_id=row["candidate_id"],
+            contact_name=row["contact_name"],
+            status=row["status"],
+            chunk_index=row["chunk_index"],
+            total_chunks=row["total_chunks"],
+            parts=json.loads(row["parts_json"] or "[]"),
+            error=row["error"],
+            audio_blob_url=row["audio_blob_url"] if "audio_blob_url" in row.keys() else None,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def create_voice_job(
+        self,
+        chat_id: str,
+        file_id: str,
+        duration_sec: int,
+        file_size: int,
+        total_chunks: int,
+        candidate_id: int | None = None,
+        contact_name: str | None = None,
+        mime_hint: str = "ogg",
+    ) -> int:
+        await self.init()
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                """INSERT INTO voice_jobs
+                   (chat_id, file_id, duration_sec, file_size, mime_hint, candidate_id, contact_name,
+                    status, chunk_index, total_chunks, parts_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, '[]', ?, ?)""",
+                (chat_id, file_id, duration_sec, file_size, mime_hint, candidate_id, contact_name, total_chunks, now, now),
+            )
+            await conn.commit()
+            return cur.lastrowid or 0
+
+    async def get_voice_job(self, job_id: int) -> VoiceJob | None:
+        await self.init()
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute("SELECT * FROM voice_jobs WHERE id = ?", (job_id,))
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return self._row_to_voice_job(row)
+
+    async def mark_voice_job_processing(self, job_id: int) -> None:
+        await self.init()
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE voice_jobs SET status='processing', updated_at=? WHERE id=? AND status IN ('pending','processing')",
+                (now, job_id),
+            )
+            await conn.commit()
+
+    async def append_voice_chunk(self, job_id: int, text: str) -> VoiceJob | None:
+        await self.init()
+        job = await self.get_voice_job(job_id)
+        if not job:
+            return None
+        parts = list(job.parts)
+        parts.append(text)
+        chunk_index = job.chunk_index + 1
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                """UPDATE voice_jobs SET chunk_index=?, parts_json=?, updated_at=?, status='processing'
+                   WHERE id=?""",
+                (chunk_index, json.dumps(parts, ensure_ascii=False), now, job_id),
+            )
+            await conn.commit()
+        return await self.get_voice_job(job_id)
+
+    async def set_voice_job_blob(self, job_id: int, blob_url: str) -> None:
+        await self.init()
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE voice_jobs SET audio_blob_url=?, updated_at=? WHERE id=?",
+                (blob_url, now, job_id),
+            )
+            await conn.commit()
+
+    async def complete_voice_job(self, job_id: int) -> None:
+        await self.init()
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE voice_jobs SET status='done', updated_at=? WHERE id=?",
+                (now, job_id),
+            )
+            await conn.commit()
+
+    async def fail_voice_job(self, job_id: int, error: str) -> None:
+        await self.init()
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE voice_jobs SET status='failed', error=?, updated_at=? WHERE id=?",
+                (error[:500], now, job_id),
+            )
+            await conn.commit()
+
+    async def list_stale_voice_jobs(self, limit: int = 5, stale_sec: int = 90) -> list[VoiceJob]:
+        await self.init()
+        cutoff = int(time.time()) - stale_sec
+        async with aiosqlite.connect(self.path) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                """SELECT * FROM voice_jobs
+                   WHERE status IN ('pending', 'processing') AND updated_at < ?
+                   ORDER BY updated_at ASC LIMIT ?""",
+                (cutoff, limit),
+            )
+            rows = await cur.fetchall()
+        return [self._row_to_voice_job(r) for r in rows]

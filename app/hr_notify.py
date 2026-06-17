@@ -11,12 +11,10 @@ def _fmt_profile(p: dict[str, Any]) -> str:
     lines = []
     if p.get("name"):
         lines.append(f"Имя: {p['name']}")
-    if p.get("age") is not None:
-        lines.append(f"Возраст: {p['age']}")
-    if p.get("is_student") is not None:
-        lines.append(f"Студент: {'да' if p['is_student'] else 'нет'}")
-    if p.get("has_experience") is not None:
-        lines.append(f"Опыт: {'да' if p['has_experience'] else 'нет'}")
+    if p.get("job_search_active") is not None:
+        lines.append(f"Поиск работы: {'да' if p['job_search_active'] else 'нет'}")
+    if p.get("experience_summary"):
+        lines.append(f"Опыт: {p['experience_summary'][:200]}")
     if p.get("city"):
         lines.append(f"Город: {p['city']}")
     return "\n".join(lines) if lines else "—"
@@ -31,13 +29,17 @@ async def notify_hr(
 ) -> None:
     if not settings.is_hr_notify_configured:
         return
-    chat = settings.telegram_hr_chat_id
     status_map = {
-        "qualified": "✅ Подходит",
+        "qualified": "✅ Анкета принята",
         "rejected": "❌ Отказ",
-        "scheduled": "📅 Собеседование",
+        "scheduled": "📅 Собеседование записано",
+        "confirmed": "✅ Кандидат подтвердил встречу",
         "handoff": "👤 Передан HR",
         "no_show": "⚠️ Не придёт",
+        "reminder_24": "🔔 Напоминание 24ч отправлено",
+        "reminder_1": "🔔 Напоминание 1ч отправлено",
+        "interview_profile": "📋 Карточка после интервью",
+        "hh_import": "📥 Новые отклики HH",
     }
     header = status_map.get(event, event)
     text = (
@@ -49,6 +51,17 @@ async def notify_hr(
         text += f"Визит: {session.interview_label}\n"
     if session.contact_name:
         text += f"TG: {session.contact_name}\n"
+    if session.candidate_id:
+        text += f"Кандидат: #{session.candidate_id}\n"
     if extra:
         text += f"\n{extra}"
-    await tg.send_message(chat, text, parse_mode="HTML")
+    for chat in settings.hr_chat_ids:
+        await tg.send_message(chat, text, parse_mode="HTML")
+
+
+async def notify_hr_text(settings: Settings, tg: TelegramClient, title: str, body: str) -> None:
+    if not settings.is_hr_notify_configured:
+        return
+    msg = f"<b>{title}</b>\n\n{body}"
+    for chat in settings.hr_chat_ids:
+        await tg.send_message(chat, msg, parse_mode="HTML")

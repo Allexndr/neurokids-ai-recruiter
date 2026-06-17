@@ -11,14 +11,14 @@ def yes_no_step(
     rules: str,
     examples_ok: str,
     examples_bad: str,
-    wa_hint: str,
+    wa_hint: str = "",
 ) -> str:
     return (
         f"📋 <b>Шаг {step_no} — {title}</b>\n\n"
         f"{question}\n\n"
         f"📌 <b>Правила:</b> {rules}\n"
-        f"{wa_hint}\n\n"
-        f"💡 <b>Примеры:</b>\n"
+        + (f"{wa_hint}\n\n" if wa_hint else "\n")
+        + f"💡 <b>Примеры:</b>\n"
         f"{examples_ok}\n\n"
         f"❌ <b>Не подходит:</b>\n"
         f"{examples_bad}"

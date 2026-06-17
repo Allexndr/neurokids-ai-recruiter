@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 _CACHE: OrderedDict[str, str] = OrderedDict()
 _CACHE_LIMIT = 150
 
-_KB_PATH = Path(__file__).resolve().parents[2] / "data" / "knowledge_ataman.md"
+_KB_PATH = Path(__file__).resolve().parents[2] / "data" / "knowledge_hr.md"
 
 
 def _norm(t: str) -> str:
@@ -34,15 +34,14 @@ def load_knowledge() -> str:
 
 _PATTERNS: list[tuple[tuple[str, ...], str]] = [
     (("стаж", "интерн", "стажиров", "тағылым"), "internship"),
-    (("опыт", "тәжірибе", "тажирибе", "маңызды ма"), "experience"),
-    (("график", "режим", "уақыт", "10:00", "6/1"), "schedule"),
-    (("не сат", "не прода", "өнім", "продукт", "товар"), "product"),
-    (("оклад", "айлық", "месяц"), "salary_detail"),
-    (("%", "процент", "пайыз", "қанша %"), "percent"),
-    (("зп", "зарплат", "табам", "табы", "ақша", "жалақы", "750"), "salary"),
-    (("жұмыс", "работа", "сетев", "mlm", "отдел"), "job"),
-    (("компания", "нарық", "клиент", "2 жыл"), "company"),
-    (("мекен", "адрес", "офис", "алтын заман", "2gis"), "address"),
+    (("опыт", "тәжірибе", "тажирибе"), "experience"),
+    (("график", "режим", "уақыт", "remote", "удал"), "schedule"),
+    (("зп", "зарплат", "табы", "жалақы", "оклад", "salary"), "salary"),
+    (("%", "процент", "пайыз"), "percent"),
+    (("что делает", "функци", "модул", "возможност", "бот умеет"), "job"),
+    (("компания", "neurokids", "кто вы"), "company"),
+    (("резюме", "cv", "pdf", "docx"), "resume"),
+    (("интервью", "собесед", "запис"), "schedule"),
 ]
 
 
@@ -55,15 +54,14 @@ def keyword_faq(text: str, lang: str) -> str | None:
                 "internship": c.FAQ_INTERNSHIP,
                 "experience": c.FAQ_EXPERIENCE,
                 "schedule": c.FAQ_SCHEDULE,
-                "product": c.FAQ_PRODUCT,
                 "salary": c.FAQ_SALARY,
-                "salary_detail": c.FAQ_SALARY_DETAIL,
                 "percent": c.FAQ_PERCENT,
                 "job": c.FAQ_JOB,
                 "company": c.FAQ_COMPANY,
-                "address": (
-                    "📍 БЦ Алтын заман, 4 этаж, 401Б\n"
-                    "https://2gis.kz/almaty/geo/9429940001536524/76.933636,43.251586"
+                "resume": (
+                    "Отправьте PDF или DOCX файлом в этот чат — AI оценит соответствие вакансии."
+                    if lang == "ru"
+                    else "PDF немесе DOCX файлын жіберіңіз — AI сәйкестікті бағalayды."
                 ),
             }.get(key)
     return None
@@ -81,6 +79,23 @@ def _cache_put(key: str, value: str) -> None:
     _CACHE.move_to_end(key)
     while len(_CACHE) > _CACHE_LIMIT:
         _CACHE.popitem(last=False)
+
+
+def faq_by_topic(topic: str, lang: str) -> str | None:
+    c = _c(lang)
+    return {
+        "salary": c.FAQ_SALARY,
+        "schedule": c.FAQ_SCHEDULE,
+        "internship": c.FAQ_INTERNSHIP,
+        "experience": c.FAQ_EXPERIENCE,
+        "company": c.FAQ_COMPANY,
+        "job": c.FAQ_JOB,
+        "resume": (
+            "Отправьте PDF или DOCX файлом — AI оценит соответствие вакансии."
+            if lang == "ru"
+            else "PDF немесе DOCX файлын жіберіңіз — AI сәйкестікті бағalayды."
+        ),
+    }.get(topic)
 
 
 async def answer_faq(

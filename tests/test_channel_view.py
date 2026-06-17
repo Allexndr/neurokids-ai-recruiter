@@ -14,35 +14,44 @@ def engine():
 
 
 @pytest.mark.asyncio
-async def test_start_shows_view_choice(engine):
-    session = Session(chat_id="1", state=State.CHOOSE_VIEW.value)
+async def test_start_shows_neurokids_language_choice(engine):
+    session = Session(chat_id="1", state="choose_view")
     reply = await engine.handle(session, "/start")
-    assert "Telegram" in reply.text or "WhatsApp" in reply.text
+    assert "Neurokids" in reply.text
+    assert "Атаман" not in reply.text
+    assert "WhatsApp" not in reply.text
+    assert session.state == State.CHOOSE_LANG.value
+    assert session.profile.get("ui_mode") == "telegram"
     assert reply.reply_markup is not None
-    assert session.state == State.CHOOSE_VIEW.value
 
 
 @pytest.mark.asyncio
-async def test_view_then_lang_then_greeting(engine):
-    session = Session(chat_id="3", state=State.CHOOSE_VIEW.value)
-    await engine.handle(session, "1")
-    assert session.profile.get("ui_mode") == "telegram"
+async def test_legacy_view_callback_resets_to_language(engine):
+    session = Session(chat_id="2", state="choose_view", profile={"ui_mode": "whatsapp"})
+    reply = await engine.handle(session, "view:telegram", is_callback=True)
+    assert "Neurokids" in reply.text
+    assert "Атаман" not in reply.text
     assert session.state == State.CHOOSE_LANG.value
-    reply = await engine.handle(session, "2")
+    assert session.profile.get("ui_mode") == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_lang_then_questionnaire(engine):
+    session = Session(chat_id="3", state=State.CHOOSE_LANG.value, profile={"ui_mode": "telegram"})
+    reply = await engine.handle(session, "lang:ru", is_callback=True)
     assert session.lang == "ru"
     assert session.profile.get("lang_locked")
-    assert "Здравствуйте" in reply.text or "менеджер" in reply.text.lower()
+    assert session.state == State.COLLECT_NAME_AGE.value
+    assert "Neurokids" in reply.text
+    assert "Шаг 1" in reply.text or "имя" in reply.text.lower()
 
 
 @pytest.mark.asyncio
 async def test_whatsapp_view_no_buttons_on_menu(engine):
-    session = Session(chat_id="2", state=State.CHOOSE_VIEW.value, lang="ru")
-    await engine.handle(session, "2")
-    assert session.profile.get("ui_mode") == "whatsapp"
-    await engine.handle(session, "1")
+    session = Session(chat_id="4", state=State.CHOOSE_LANG.value, lang="ru", profile={"ui_mode": "whatsapp"})
+    session.profile["lang_locked"] = True
     session.state = State.WELCOME_QUALIFIED.value
     session.profile["name"] = "Айым"
-    session.profile["lang_locked"] = True
     reply = await engine.handle(session, "1")
     assert reply.reply_markup is None
     assert "1 —" in reply.text or "Уақыт" in reply.text or "Выберите" in reply.text

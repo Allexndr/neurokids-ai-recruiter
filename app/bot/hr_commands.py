@@ -8,7 +8,7 @@ from app.ai.prompts_hr import COMPARE_SYSTEM
 from app.sourcing.hh_client import HHClient
 from app.sourcing.resume_parser import extract_text_from_bytes
 from app.sourcing.scorer import parse_csv_candidates, score_resume
-from app.storage.db import store
+from app.storage import store
 
 if TYPE_CHECKING:
     from app.ai.router import LLMRouter
@@ -59,6 +59,21 @@ async def handle_hr_command(
     if low.startswith("/hh_responses "):
         return await _hh_responses(t, settings, llm)
 
+    if low.startswith("/comment "):
+        return await _comment_command(t)
+
+    if low.startswith("/outreach "):
+        return await _outreach_command(t, settings)
+
+    if low.startswith("/hh_sync"):
+        from app.sourcing.hh_sync import sync_hh_responses
+
+        result = await sync_hh_responses(settings, llm)
+        return (
+            f"✅ HH sync: вакансий {result['vacancies']}, "
+            f"импортировано {result['imported']}, пропущено {result['skipped']}"
+        )
+
     if low.startswith("/stats"):
         stats = await store.get_stats()
         lines = ["<b>Статистика воронки</b>"] + [f"{k}: {v}" for k, v in sorted(stats.items())]
@@ -69,18 +84,24 @@ async def handle_hr_command(
 
 def _help_text() -> str:
     return (
-        "<b>HR-команды recruter_support_bot</b>\n\n"
+        "<b>HR — кнопки + команды /</b>\n\n"
+        "Основное — через панель 👇\n"
+        "Команды для точных действий:\n\n"
         "/vacancy create Название | навык1, навык2 — создать вакансию\n"
         "/vacancy list — список вакансий\n"
+        "/vacancy link ID HH_VACANCY_ID — привязать HH\n"
         "/candidates [id_вакансии] — топ кандидатов\n"
         "/candidate 5 — карточка кандидата\n"
+        "/comment 5 текст — комментарий HR\n"
+        "/outreach 5 — написать кандидату в Telegram\n"
         "/rank [id_вакансии] — рейтинг по AI\n"
         "/search запрос — поиск в базе\n"
         "/compare 1 2 — сравнить кандидатов\n"
         "/import_resume — прикрепите PDF/DOCX к сообщению\n"
-        "/import_csv — прикрепите CSV (name, phone, resume)\n"
+        "/import_csv — прикрепите CSV (name, phone, resume, source=linkedin)\n"
         "/hh_search запрос — поиск резюме HH (платный доступ)\n"
         "/hh_responses id_вакансии_hh — отклики на вакансию\n"
+        "/hh_sync — авто-сбор новых откликов HH\n"
         "/stats — воронка"
     )
 
@@ -97,8 +118,15 @@ async def _vacancy_command(text: str) -> str:
             return "Вакансий нет. Создайте: /vacancy create Менеджер | продажи, CRM"
         lines = ["<b>Вакансии</b>"]
         for v in vacs:
-            lines.append(f"#{v.id} {v.title} {'✅' if v.active else '⏸'}")
+            hh = f" HH:{v.hh_vacancy_id}" if v.hh_vacancy_id else ""
+            lines.append(f"#{v.id} {v.title} {'✅' if v.active else '⏸'}{hh}")
         return "\n".join(lines)
+
+    if sub == "link" and len(parts) >= 4:
+        if not parts[2].isdigit():
+            return "Использование: /vacancy link 1 HH_VACANCY_ID"
+        ok = await store.set_vacancy_hh_id(int(parts[2]), parts[3])
+        return f"✅ Вакансия #{parts[2]} привязана к HH {parts[3]}" if ok else "Вакансия не найдена"
 
     if sub == "create" and len(parts) >= 3:
         raw = parts[2]
@@ -148,6 +176,20 @@ async def _candidate_detail(text: str) -> str:
         lines.append("\n<b>Последние сообщения:</b>")
         for m in reversed(msgs):
             lines.append(f"{m['direction']}: {m['body'][:200]}")
+    analysis = await store.get_latest_interview_analysis(c.id)
+    if analysis:
+        lines.append("\n<b>Интервью (AI):</b>")
+        if analysis.get("summary"):
+            lines.append(analysis["summary"][:800])
+        prof = analysis.get("profile") or {}
+        if prof.get("recommendations"):
+            rec = prof["recommendations"]
+            lines.append("Рекомендации: " + ("; ".join(rec) if isinstance(rec, list) else str(rec)))
+    comments = (c.profile or {}).get("hr_comments") or []
+    if comments:
+        lines.append("\n<b>Комментарии HR:</b>")
+        for cm in comments[-5:]:
+            lines.append(f"• {cm.get('text', '')[:200]}")
     return "\n".join(lines)
 
 
@@ -231,8 +273,9 @@ async def _import_csv(data: bytes, llm: LLMRouter | None) -> str:
             result = await score_resume(llm, vacancy.title, vacancy.criteria, resume)
             score = result.get("score")
             summary = result.get("summary")
+        source = row.get("source") or row.get("источник") or "crm"
         await store.upsert_candidate(
-            source="crm", name=name or None, contact=phone or None,
+            source=source, name=name or None, contact=phone or None,
             resume_text=resume or None, vacancy_id=vacancy.id if vacancy else None,
             match_score=score, match_summary=summary,
         )
@@ -316,3 +359,29 @@ async def _hh_responses(text: str, settings: Settings, llm: LLMRouter | None) ->
         )
         lines.append(f"#{cid} {title} — {score or '—'}")
     return "\n".join(lines)
+
+
+async def _comment_command(text: str) -> str:
+    parts = text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return "Использование: /comment 5 Текст комментария"
+    cid = int(parts[1])
+    ok = await store.add_hr_comment(cid, parts[2])
+    return f"✅ Комментарий сохранён для #{cid}" if ok else "Кандидат не найден"
+
+
+async def _outreach_command(text: str, settings: Settings) -> str:
+    from app.comms.outreach import send_telegram_outreach
+    from app.telegram_api import TelegramClient
+
+    parts = text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return "Использование: /outreach 5 (кандидат с chat_id в Telegram)"
+    c = await store.get_candidate(int(parts[1]))
+    if not c or not c.chat_id:
+        return "У кандидата нет Telegram chat_id"
+    if not settings.is_telegram_configured:
+        return "Telegram не настроен"
+    tg = TelegramClient(settings.telegram_bot_token)
+    ok = await send_telegram_outreach(tg, c.chat_id)
+    return f"✅ Приглашение отправлено кандидату #{c.id}" if ok else "Не удалось отправить"

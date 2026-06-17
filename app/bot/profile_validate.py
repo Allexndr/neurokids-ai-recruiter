@@ -1,4 +1,4 @@
-"""Пошаговая валидация анкеты: имя/возраст, студент, опыт."""
+"""Пошаговая валидация анкеты кандидата (TZ: модуль 2)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from app.bot.screening import MAX_AGE, parse_yes_no
+from app.bot.screening import parse_yes_no
 
 _NAME_RE = re.compile(
     r"^[\s\d]*([a-zA-Zа-яёА-ЯЁәіңғүұқөһӘІҢҒҮҰҚӨҺ][a-zA-Zа-яёәіңғүұқөһӘІҢҒҮҰҚӨҺ\s\-']{1,35})$",
@@ -58,100 +58,62 @@ def is_garbage(text: str, step: str) -> bool:
     return False
 
 
-def parse_name_age(text: str) -> ValidationResult:
+def parse_name(text: str) -> ValidationResult:
     raw = (text or "").strip()
     if is_garbage(raw, "name_age"):
         return ValidationResult(False, "garbage")
-
-    low = _norm(raw)
-    age: int | None = None
-
-    m = _AGE_RE.search(low) or _AGE_TRAIL_RE.search(low)
-    if m:
-        age = int(m.group(1))
-
-    if age is None:
-        nums = re.findall(r"\b(\d{1,2})\b", low)
-        for n in nums:
-            v = int(n)
-            if 16 <= v <= 99:
-                age = v
-                break
-
-    if age is None:
-        return ValidationResult(False, "no_age")
-
-    if age < 16:
-        return ValidationResult(False, "age_young")
-    if age > 55:
-        return ValidationResult(False, "age_invalid")
-
-    name_raw = raw
-    if m:
-        name_raw = re.sub(re.escape(m.group(0)), "", name_raw, flags=re.I)
-    name_raw = re.sub(r"[,;]+", " ", name_raw)
+    name_raw = re.sub(r"[,;]+", " ", raw)
     name_raw = re.sub(r"\d+", " ", name_raw).strip()
     name_raw = re.sub(r"\s+", " ", name_raw).strip(" ,.-")
-
     if not name_raw or len(name_raw) < 2:
         return ValidationResult(False, "no_name")
-
     if not _NAME_RE.match(name_raw) and not re.search(r"[a-zA-Zа-яёәіңғүұқөһ]", name_raw, re.I):
         return ValidationResult(False, "bad_name")
-
-    if len(name_raw) > 40 or re.search(r"\d{3,}", name_raw):
+    if len(name_raw) > 40:
         return ValidationResult(False, "bad_name")
+    parts = name_raw.split()
+    name = " ".join(w.capitalize() for w in parts[:2])
+    return ValidationResult(True, data={"name": name})
 
-    name = name_raw.split()[0].capitalize()
-    if len(name_raw.split()) > 1:
-        name = " ".join(w.capitalize() for w in name_raw.split()[:2])
 
-    return ValidationResult(True, data={"name": name, "age": age})
+def parse_name_age(text: str) -> ValidationResult:
+    """Совместимость: только имя."""
+    return parse_name(text)
+
+
+def parse_job_search_answer(text: str) -> ValidationResult:
+    raw = (text or "").strip()
+    if is_garbage(raw, "yes_no"):
+        return ValidationResult(False, "garbage")
+    yn = parse_yes_no(raw)
+    if yn is None:
+        return ValidationResult(False, "yes_no_unclear")
+    return ValidationResult(True, data={"job_search_active": yn})
+
+
+def parse_experience_text(text: str) -> ValidationResult:
+    raw = (text or "").strip()
+    if is_garbage(raw, "name_age"):
+        return ValidationResult(False, "garbage")
+    if len(raw) < 8:
+        return ValidationResult(False, "experience_short")
+    return ValidationResult(True, data={"experience_summary": raw[:2000]})
 
 
 def parse_student_answer(text: str) -> ValidationResult:
-    raw = (text or "").strip()
-    if is_garbage(raw, "yes_no"):
-        return ValidationResult(False, "garbage")
-
-    low = _norm(raw)
-    if low in ("1", "иә", "ия", "да", "yes", "иа"):
-        return ValidationResult(True, data={"is_student": True})
-    if low in ("2", "жоқ", "жок", "нет", "no"):
-        return ValidationResult(True, data={"is_student": False})
-
-    yn = parse_yes_no(raw)
-    if yn is None:
-        if any(x in low for x in ("студент", "учусь", "универ", "сабақ", "пары")):
-            if any(x in low for x in ("не ", "жоқ", "нет", "эмес")):
-                return ValidationResult(True, data={"is_student": False})
-            return ValidationResult(True, data={"is_student": True})
-        return ValidationResult(False, "yes_no_unclear")
-
-    return ValidationResult(True, data={"is_student": yn})
+    r = parse_job_search_answer(text)
+    if not r.ok:
+        return r
+    return ValidationResult(True, data={"is_student": r.data.get("job_search_active")})
 
 
 def parse_experience_answer(text: str) -> ValidationResult:
-    raw = (text or "").strip()
-    if is_garbage(raw, "yes_no"):
-        return ValidationResult(False, "garbage")
-
-    low = _norm(raw)
-    if low in ("1", "иә", "ия", "да", "yes", "иа"):
-        return ValidationResult(True, data={"has_experience": True})
-    if low in ("2", "жоқ", "жок", "нет", "no"):
-        return ValidationResult(True, data={"has_experience": False})
-
-    yn = parse_yes_no(raw)
-    if yn is None:
-        if any(x in low for x in ("опыт", "тәжірибе", "работал", "жұмыс")):
-            if any(x in low for x in ("жоқ", "нет", "не ", "без опыта")):
-                return ValidationResult(True, data={"has_experience": False})
-            return ValidationResult(True, data={"has_experience": True})
-        return ValidationResult(False, "yes_no_unclear")
-
-    return ValidationResult(True, data={"has_experience": yn})
+    yn = parse_yes_no(text)
+    if yn is not None:
+        return ValidationResult(True, data={"has_experience": yn})
+    return parse_experience_text(text)
 
 
 def age_over_limit(age: int) -> bool:
-    return age > MAX_AGE
+    _ = age
+    return False
